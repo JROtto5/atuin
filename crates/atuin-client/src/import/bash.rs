@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::str;
 
@@ -5,7 +6,6 @@ use async_trait::async_trait;
 use atuin_common::path::PathBufExt as _;
 use atuin_common::userio;
 use eyre::{Result, eyre};
-use itertools::Itertools;
 use jiff::{SignedDuration, Timestamp};
 
 use super::{Importer, Loader, get_histfile_path, unix_byte_lines};
@@ -33,18 +33,15 @@ impl Importer for Bash {
     }
 
     async fn entries(&mut self) -> Result<usize> {
-        let count = unix_byte_lines(&self.bytes)
-            .map(LineType::from)
+        let count = parse_lines(&self.bytes)
+            .iter()
             .filter(|line| matches!(line, LineType::Command(_)))
             .count();
         Ok(count)
     }
 
     async fn load(self, h: &mut impl Loader) -> Result<()> {
-        let lines = unix_byte_lines(&self.bytes)
-            .map(LineType::from)
-            .filter(|line| !matches!(line, LineType::NotUtf8)) // invalid utf8 are ignored
-            .collect_vec();
+        let lines = parse_lines(&self.bytes);
 
         let (commands_before_first_timestamp, first_timestamp) = lines
             .iter()
@@ -59,8 +56,9 @@ impl Importer for Bash {
         // if no timestamp is recorded, then use this increment to set an arbitrary timestamp
         // to preserve ordering
         // this increment is deliberately very small to prevent particularly fast fingers
-        // causing ordering issues; it also helps in handling the "here document" syntax,
-        // where several lines are recorded in succession without individual timestamps
+        // causing ordering issues; it also helps in handling the "here document" syntax
+        // in a file that doesn't start with a timestamp, where several lines are recorded in
+        // succession without individual timestamps
         let timestamp_increment = SignedDuration::from_millis(1);
 
         // make sure there is a minimum amount of time before the first known timestamp
@@ -105,7 +103,7 @@ enum LineType<'a> {
     /// that represents seconds since UNIX epoch.
     Timestamp(Timestamp),
     /// Anything else.
-    Command(&'a str),
+    Command(Cow<'a, str>),
 }
 impl<'a> From<&'a [u8]> for LineType<'a> {
     fn from(bytes: &'a [u8]) -> Self {
@@ -118,9 +116,61 @@ impl<'a> From<&'a [u8]> for LineType<'a> {
 
         match try_parse_line_as_timestamp(line) {
             Some(time) => LineType::Timestamp(time),
-            None => LineType::Command(line),
+            None => LineType::Command(Cow::Borrowed(line)),
         }
     }
+}
+
+/// Splits the history file into timestamps and commands, the way bash reads it back.
+///
+/// When the file starts with a timestamp and `HISTTIMEFORMAT` is set, bash reads every line up
+/// to the next timestamp as one command. Bash writes a command over several lines when it
+/// contains a here-document, or for any multi-line command with `shopt -s lithist`. The
+/// importer assumes `HISTTIMEFORMAT` was set because that setting is what writes the
+/// timestamps.
+fn parse_lines(bytes: &[u8]) -> Vec<LineType<'_>> {
+    let mut lines = unix_byte_lines(bytes).map(LineType::from).peekable();
+    if !matches!(lines.peek(), Some(LineType::Timestamp(_))) {
+        // invalid utf8 lines are ignored
+        return lines.filter(|line| !matches!(line, LineType::NotUtf8)).collect();
+    }
+
+    let mut parsed = Vec::new();
+    let mut entry = Vec::new();
+    let mut valid = true;
+    for line in lines {
+        match line {
+            LineType::Timestamp(_) => {
+                if valid {
+                    push_entry(&mut parsed, &entry);
+                }
+                entry.clear();
+                valid = true;
+                parsed.push(line);
+            }
+            // an entry with an invalid utf8 line is ignored as a whole
+            LineType::NotUtf8 => valid = false,
+            LineType::Empty => entry.push(Cow::Borrowed("")),
+            LineType::Command(c) => entry.push(c),
+        }
+    }
+    if valid {
+        push_entry(&mut parsed, &entry);
+    }
+    parsed
+}
+
+/// Adds the lines of one timestamped entry as a single command, without blank lines at either end.
+fn push_entry<'a>(parsed: &mut Vec<LineType<'a>>, entry: &[Cow<'a, str>]) {
+    let Some(first) = entry.iter().position(|line| !line.is_empty()) else {
+        return;
+    };
+    let last = entry.iter().rposition(|line| !line.is_empty()).unwrap_or(first);
+    let command = match &entry[first..=last] {
+        [line] => line.clone(),
+        lines => Cow::Owned(lines.join("\n")),
+    };
+    parsed.push(LineType::Command(command));
 }
 
 fn try_parse_line_as_timestamp(line: &str) -> Option<Timestamp> {
@@ -202,6 +252,50 @@ cd ../
         ]);
     }
 
+    #[rstest]
+    #[case::here_document(
+        b"#1672918999\ncat <<END\nhello\nEND\n\n#1672919006\necho after\n".to_vec(),
+        vec!["cat <<END\nhello\nEND", "echo after"],
+        vec![1_672_918_999, 1_672_919_006]
+    )]
+    #[case::lithist_loop(
+        b"#1672918999\nfor i in 1 2\ndo\n\n  echo $i\ndone\n#1672919006\necho after\n".to_vec(),
+        vec!["for i in 1 2\ndo\n\n  echo $i\ndone", "echo after"],
+        vec![1_672_918_999, 1_672_919_006]
+    )]
+    #[case::blank_line_after_timestamp(
+        b"#1672918999\n\ngit reset\n#1672919006\necho after\n".to_vec(),
+        vec!["git reset", "echo after"],
+        vec![1_672_918_999, 1_672_919_006]
+    )]
+    // a shell without HISTTIMEFORMAT appended the last two lines, and bash with
+    // HISTTIMEFORMAT set reads them as part of the entry before them
+    #[case::untimestamped_tail(
+        b"#1672918999\ngit reset\n#1672919006\necho after\nls\npwd\n".to_vec(),
+        vec!["git reset", "echo after\nls\npwd"],
+        vec![1_672_918_999, 1_672_919_006]
+    )]
+    #[case::invalid_utf8_line(
+        b"#1672918999\ncat <<END\nhel\xffo\nEND\n#1672919006\necho after\n".to_vec(),
+        vec!["echo after"],
+        vec![1_672_919_006]
+    )]
+    #[tokio::test]
+    async fn parse_multiline_entries(
+        #[case] bytes: Vec<u8>,
+        #[case] expected_commands: Vec<&str>,
+        #[case] expected_seconds: Vec<i64>,
+    ) {
+        let mut bash = Bash { bytes };
+        assert_eq!(bash.entries().await.unwrap(), expected_commands.len());
+
+        let mut loader = TestLoader::default();
+        bash.load(&mut loader).await.unwrap();
+
+        assert_equal(loader.buf.iter().map(|h| h.command.as_str()), expected_commands);
+        assert_equal(loader.buf.iter().map(|h| h.timestamp.as_second()), expected_seconds);
+    }
+
     fn is_strictly_sorted<T>(iter: impl IntoIterator<Item = T>) -> bool
     where
         T: Clone + PartialOrd,
@@ -241,8 +335,10 @@ cargo update
         // last second `Timestamp` can represent, i.e. 9999-12-30 22:00:00 UTC).
         // 1000 untimestamped commands walk the 1ms increment past .999 and off the
         // end of the representable range.
-        let commands: Vec<String> = (0..1_000).map(|i| format!("cmd-{i}")).collect();
-        let bytes = format!("#253402207200\n{}\n", commands.join("\n")).into_bytes();
+        // the untimestamped first line keeps bash from reading the rest as one command
+        let commands: Vec<String> = (0..=1_000).map(|i| format!("cmd-{i}")).collect();
+        let bytes =
+            format!("{}\n#253402207200\n{}\n", commands[0], commands[1..].join("\n")).into_bytes();
 
         let mut bash = Bash { bytes };
         assert_eq!(bash.entries().await.unwrap(), commands.len());

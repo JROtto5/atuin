@@ -15,6 +15,7 @@ use futures::stream::BoxStream;
 use futures::{TryStreamExt as _, future};
 use itertools::Itertools;
 use jiff::Timestamp;
+use jiff::tz::TimeZone;
 use sql_builder::bind::Bind;
 use sql_builder::{SqlBuilder, SqlName, esc, quote};
 use sqlx::sqlite::{SqlitePool, SqliteRow};
@@ -1218,7 +1219,7 @@ impl Sqlite {
     }
 
     #[instrument(level = "trace", skip_all, fields(id = ?h.id), err)]
-    pub async fn stats(&self, h: &History) -> Result<HistoryStats> {
+    pub async fn stats(&self, h: &History, tz: &TimeZone) -> Result<HistoryStats> {
         let mut total = SqlBuilder::select_from("history");
         total.field("count(1)").and_where("command = ?1").and_where_is_null("deleted_at");
 
@@ -1236,16 +1237,10 @@ impl Sqlite {
             .and_where_is_null("deleted_at")
             .group_by("exit");
 
-        // rewrite the following with sqlbuilder
-        let mut day_of_week = SqlBuilder::select_from("history");
-        day_of_week
-            .fields(&[
-                "strftime('%w', ROUND(timestamp / 1000000000), 'unixepoch') AS day_of_week",
-                "count(1) as count",
-            ])
-            .and_where("command = ?1")
-            .and_where_is_null("deleted_at")
-            .group_by("day_of_week");
+        // SQLite only knows UTC and the system zone, so the weekday of each run is worked out in
+        // `tz` below.
+        let mut timestamps = SqlBuilder::select_from("history");
+        timestamps.field("timestamp").and_where("command = ?1").and_where_is_null("deleted_at");
 
         // Intentionally format the string with 01 hardcoded. We want the average runtime for the
         // _entire month_, but will later parse it as a datetime for sorting
@@ -1266,7 +1261,7 @@ impl Sqlite {
         let total = total.sql().expect("issue in stats total query");
         let average = average.sql().expect("issue in stats average query");
         let exits = exits.sql().expect("issue in stats exits query");
-        let day_of_week = day_of_week.sql().expect("issue in stats day of week query");
+        let timestamps = timestamps.sql().expect("issue in stats timestamps query");
         let duration_over_time =
             duration_over_time.sql().expect("issue in stats duration over time query");
 
@@ -1276,7 +1271,7 @@ impl Sqlite {
             (i64,),
             (f64,),
             Vec<(i64, i64)>,
-            Vec<(String, i64)>,
+            [i64; 7],
             Vec<(String, f64)>,
         ) = tokio::try_join!(
             db::query_as(sqlx::AssertSqlSafe(total)).bind(&h.command).fetch_one(self.sqlite.pool()),
@@ -1284,14 +1279,22 @@ impl Sqlite {
                 .bind(&h.command)
                 .fetch_one(self.sqlite.pool()),
             db::query_as(sqlx::AssertSqlSafe(exits)).bind(&h.command).fetch_all(self.sqlite.pool()),
-            db::query_as(sqlx::AssertSqlSafe(day_of_week))
+            db::query_scalar::<_, i64>(sqlx::AssertSqlSafe(timestamps))
                 .bind(&h.command)
-                .fetch_all(self.sqlite.pool()),
+                .fetch(self.sqlite.pool())
+                .try_fold([0; 7], |mut days, nanos| {
+                    let timestamp = Timestamp::from_unix_nanos_i64(nanos);
+                    let day = tz.to_datetime(timestamp).weekday().to_sunday_zero_offset();
+                    days[usize::conv(day)] += 1;
+                    future::ready(Ok(days))
+                }),
             db::query_as(sqlx::AssertSqlSafe(duration_over_time))
                 .bind(&h.command)
                 .fetch_all(self.sqlite.pool()),
         )?;
 
+        let day_of_week =
+            day_of_week.iter().enumerate().map(|(day, count)| (day.to_string(), *count)).collect();
         let duration_over_time =
             duration_over_time.iter().map(|f| (f.0.clone(), f.1.cast_nearest())).collect();
 
@@ -1677,12 +1680,48 @@ mod test {
                 selected = Some(entry);
             }
         }
-        let stats = db.stats(&selected.unwrap()).await.unwrap();
+        let stats = db.stats(&selected.unwrap(), &TimeZone::UTC).await.unwrap();
         assert_eq!(stats.total, 3);
         assert_eq!(stats.average_duration, 2_000_000_000);
         assert_eq!(stats.exits.iter().map(|(_, count)| count).sum::<i64>(), 3);
         assert_eq!(stats.day_of_week.iter().map(|(_, count)| count).sum::<i64>(), 3);
         assert_eq!(stats.duration_over_time[0].1, 2_000_000_000);
+    }
+
+    /// A run on a Wednesday in UTC can fall on the Tuesday or the Thursday in the configured zone.
+    /// A named zone uses the offset in force at each run, so 04:30 UTC on a Wednesday is still
+    /// Tuesday in New York in January and already Wednesday in July. The days are numbered from
+    /// Sunday.
+    #[rstest]
+    #[case::utc("2024-01-03T03:00:00Z", "utc", "3")]
+    #[case::behind_utc("2024-01-03T03:00:00Z", "-5", "2")]
+    #[case::ahead_of_utc("2024-01-03T22:00:00Z", "+9", "4")]
+    #[case::named_zone_standard_time("2024-01-03T04:30:00Z", "America/New_York", "2")]
+    #[case::named_zone_daylight_saving_time("2024-07-03T04:30:00Z", "America/New_York", "3")]
+    #[tokio::test]
+    async fn inspector_stats_count_days_in_the_time_zone(
+        #[future] empty_db: Sqlite,
+        #[case] timestamp: Timestamp,
+        #[case] zone: TimeZoneSpec,
+        #[case] expected_day: &str,
+    ) {
+        let db = empty_db.await;
+        let entry: History = History::capture()
+            .timestamp(timestamp)
+            .command("echo weekday")
+            .cwd("/tmp")
+            .build()
+            .into();
+        db.save(&entry).await.unwrap();
+
+        let stats = db.stats(&entry, &zone.time_zone()).await.unwrap();
+        let days: Vec<_> = stats
+            .day_of_week
+            .iter()
+            .filter(|(_, count)| *count > 0)
+            .map(|(day, count)| (day.as_str(), *count))
+            .collect();
+        assert_eq!(days, [(expected_day, 1)]);
     }
 
     #[rstest]

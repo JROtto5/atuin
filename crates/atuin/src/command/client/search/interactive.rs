@@ -2276,7 +2276,7 @@ pub async fn history(
                     stats
                 } else {
                     stats_for = Some(selected.command.clone());
-                    Some(db.stats(selected).await?.into())
+                    Some(db.stats(selected, &settings.timezone.time_zone()).await?.into())
                 }
             } else {
                 (app.inspecting_state.previous, app.inspecting_state.next) =
